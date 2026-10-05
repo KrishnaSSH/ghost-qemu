@@ -124,35 +124,39 @@ jobs:
       - name: Build
         working-directory: qemu-src
         run: |
-          ./configure --prefix=/ \
+          set -euo pipefail
+          ./configure --prefix=/ghost-qemu \
             --target-list=x86_64-softmmu --enable-slirp
           ninja -C build
+          rm -rf dist
           DESTDIR="$PWD/dist" ninja -C build install
 
-      - name: Bundle DLLs
-        working-directory: qemu-src/dist/bin
-        run: |
-          set -euo pipefail
-          pending=$(ldd ./*.exe | awk '/\/mingw64\//{print $3}' | sort -u)
-          while [ -n "$pending" ]; do
-            new=""
-            for d in $pending; do
-              b=$(basename "$d")
-              [ -e "$b" ] && continue
-              cp "$d" .
-              new="$new $(ldd "$b" | awk '/\/mingw64\//{print $3}')"
-            done
-            pending=$(printf '%s\n' $new | sort -u)
-          done
-
-      - name: Package
+      - name: Bundle DLLs and package
         working-directory: qemu-src
         run: |
           set -euo pipefail
+          EXE=$(find dist -name 'qemu-system-x86_64.exe' | head -1)
+          test -n "$EXE"
+          BIN=$(dirname "$EXE")
+          ROOT=$(dirname "$BIN")
+          # bundle mingw DLL dependencies (transitive) next to the binaries
+          ( cd "$BIN"
+            pending=$(ldd ./*.exe | awk '/\/mingw64\//{print $3}' | sort -u)
+            while [ -n "$pending" ]; do
+              new=""
+              for d in $pending; do
+                b=$(basename "$d")
+                [ -e "$b" ] && continue
+                cp "$d" .
+                new="$new $(ldd "$b" | awk '/\/mingw64\//{print $3}')"
+              done
+              pending=$(printf '%s\n' $new | sort -u)
+            done )
+          cp ../patchrepo/anti-detection.diff "$ROOT/"
+          WS=$(cygpath -u "$GITHUB_WORKSPACE")
           NAME="ghost-qemu-${{ github.ref_name }}-x86_64-windows"
-          cp ../patchrepo/anti-detection.diff dist/
-          ( cd dist && zip -qr "${GITHUB_WORKSPACE}/${NAME}.zip" . )
-          ( cd "$GITHUB_WORKSPACE" && sha256sum "${NAME}.zip" > "${NAME}.zip.sha256" )
+          ( cd "$ROOT" && zip -qr "$WS/$NAME.zip" . )
+          ( cd "$WS" && sha256sum "$NAME.zip" > "$NAME.zip.sha256" )
 
       - uses: actions/upload-artifact@v4
         with:
