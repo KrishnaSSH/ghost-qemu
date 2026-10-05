@@ -1,0 +1,176 @@
+name: Build patched QEMU
+
+# On a pushed tag: clone the latest upstream QEMU release, apply
+# anti-detection.diff, build x86_64-softmmu for Linux and Windows, and publish
+# both binaries to a GitHub Release for that tag.
+
+on:
+  push:
+    tags:
+      - '*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-patched-qemu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  QEMU_REMOTE: https://github.com/qemu/qemu.git
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      qemu_ref: ${{ steps.pick.outputs.qemu_ref }}
+    steps:
+      - name: Resolve latest QEMU release tag
+        id: pick
+        run: |
+          set -euo pipefail
+          QEMU_REF=$(git ls-remote --tags --refs "$QEMU_REMOTE" 'v*' \
+            | sed 's#.*/##' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1)
+          test -n "$QEMU_REF"
+          echo "qemu_ref=$QEMU_REF" >> "$GITHUB_OUTPUT"
+          echo "Latest QEMU release: $QEMU_REF"
+
+  build-linux:
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      QEMU_REF: ${{ needs.prepare.outputs.qemu_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patchrepo
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            git build-essential ninja-build pkg-config python3 python3-venv \
+            libglib2.0-dev libpixman-1-dev libslirp-dev zlib1g-dev flex bison
+
+      - name: Clone QEMU and apply patch
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$QEMU_REF" "$QEMU_REMOTE" qemu-src
+          cd qemu-src
+          p=../patchrepo/anti-detection.diff
+          if git apply --check "$p" 2>/dev/null; then git apply "$p"
+          elif git apply --3way "$p" 2>/dev/null; then echo "applied with --3way"
+          else echo "fuzzy apply"; patch -p1 --fuzz=3 < "$p"; fi
+
+      - name: Build
+        working-directory: qemu-src
+        run: |
+          ./configure --prefix=/opt/ghost-qemu \
+            --target-list=x86_64-softmmu --enable-slirp
+          ninja -C build
+          DESTDIR="$PWD/dist" ninja -C build install
+
+      - name: Package
+        working-directory: qemu-src
+        run: |
+          set -euo pipefail
+          NAME="ghost-qemu-${{ github.ref_name }}-x86_64-linux"
+          cp ../patchrepo/anti-detection.diff dist/
+          tar -C dist -czf "${GITHUB_WORKSPACE}/${NAME}.tar.gz" .
+          ( cd "$GITHUB_WORKSPACE" && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: ghost-qemu-*-x86_64-linux.tar.gz*
+
+  build-windows:
+    needs: prepare
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      QEMU_REF: ${{ needs.prepare.outputs.qemu_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: patchrepo
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git patch tar zip
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-ninja mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-pip mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman
+            mingw-w64-x86_64-zlib bison flex
+
+      - name: Clone QEMU and apply patch
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$QEMU_REF" "$QEMU_REMOTE" qemu-src
+          cd qemu-src
+          p=../patchrepo/anti-detection.diff
+          if git apply --check "$p" 2>/dev/null; then git apply "$p"
+          elif git apply --3way "$p" 2>/dev/null; then echo "applied with --3way"
+          else echo "fuzzy apply"; patch -p1 --fuzz=3 < "$p"; fi
+
+      - name: Build
+        working-directory: qemu-src
+        run: |
+          ./configure --prefix=/ \
+            --target-list=x86_64-softmmu --enable-slirp
+          ninja -C build
+          DESTDIR="$PWD/dist" ninja -C build install
+
+      - name: Bundle DLLs
+        working-directory: qemu-src/dist/bin
+        run: |
+          set -euo pipefail
+          pending=$(ldd ./*.exe | awk '/\/mingw64\//{print $3}' | sort -u)
+          while [ -n "$pending" ]; do
+            new=""
+            for d in $pending; do
+              b=$(basename "$d")
+              [ -e "$b" ] && continue
+              cp "$d" .
+              new="$new $(ldd "$b" | awk '/\/mingw64\//{print $3}')"
+            done
+            pending=$(printf '%s\n' $new | sort -u)
+          done
+
+      - name: Package
+        working-directory: qemu-src
+        run: |
+          set -euo pipefail
+          NAME="ghost-qemu-${{ github.ref_name }}-x86_64-windows"
+          cp ../patchrepo/anti-detection.diff dist/
+          ( cd dist && zip -qr "${GITHUB_WORKSPACE}/${NAME}.zip" . )
+          ( cd "$GITHUB_WORKSPACE" && sha256sum "${NAME}.zip" > "${NAME}.zip.sha256" )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: ghost-qemu-*-x86_64-windows.zip*
+
+  release:
+    if: github.event_name == 'push'
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ghost-qemu ${{ github.ref_name }}
+          files: assets/*
