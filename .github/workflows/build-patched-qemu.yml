@@ -105,7 +105,7 @@ jobs:
           msystem: MINGW64
           update: true
           install: >-
-            git patch tar zip
+            git patch tar zip diffutils
             mingw-w64-x86_64-gcc mingw-w64-x86_64-ninja mingw-w64-x86_64-python
             mingw-w64-x86_64-python-pip mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-glib2 mingw-w64-x86_64-pixman
